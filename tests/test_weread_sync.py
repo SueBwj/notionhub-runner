@@ -73,12 +73,16 @@ class SyncTests(unittest.TestCase):
         with patch.object(sync, "weread", return_value={"book": {"progress": 45, "recordReadingTime": 3600}}), \
              patch.object(sync, "save", return_value="book-page") as save:
             sync.sync_books(shelf, [], existing, set(), indexes,
-                            {"authors": set(), "categories": set()}, "metadata_backfill", False, counts)
+                            {"authors": set(), "categories": set()},
+                            {"year": {"1970-01-01": {"id": "year-page"}}},
+                            "metadata_backfill", False, counts)
         properties = save.call_args.args[2]
         self.assertEqual(properties["作者"], {"relation": [{"id": "author-page"}]})
         self.assertEqual(properties["分类"], {"relation": [{"id": "category-page"}]})
         self.assertEqual(properties["阅读时长"], {"number": 3600})
         self.assertEqual(properties["阅读进度"], {"number": 0.45})
+        self.assertEqual(properties["年"], {"relation": [{"id": "year-page"}]})
+        self.assertEqual(save.call_args.kwargs["icon"], sync.BOOK_ICON)
 
 
 if __name__ == "__main__":

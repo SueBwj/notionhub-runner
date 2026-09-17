@@ -19,6 +19,7 @@ NOTION_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2026-03-11"
 SKILL_VERSION = "1.0.4"
 TZ = ZoneInfo("Asia/Shanghai")
+BOOK_ICON = {"type": "icon", "icon": {"name": "book-closed", "color": "gray"}}
 SOURCES = {
     "books": "08e978ae-e26a-8315-b4cc-0737159f13b3",
     "notes": "648978ae-e26a-834f-a32d-874331ad4f5b",
@@ -65,6 +66,11 @@ def request(url, payload=None, headers=None, method=None):
                 continue
             # Do not log response bodies: they can include private reading content.
             raise RuntimeError(f"HTTP {error.code} from {url.split('/')[2]} {url.split('/v1')[-1][:80]}") from None
+        except (urllib.error.URLError, TimeoutError):
+            if attempt < 6:
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f"Network timeout from {url.split('/')[2]}") from None
     raise RuntimeError("Request retry limit exceeded")
 
 
@@ -187,16 +193,21 @@ def index_unique(rows, key):
     return result, duplicates
 
 
-def save(role, page_id, properties, dry_run, counts, children=None):
+def save(role, page_id, properties, dry_run, counts, children=None, icon=None):
     counts[f"{role}_{'update' if page_id else 'create'}"] += 1
     if dry_run:
         return page_id or f"dry-{role}-{counts[f'{role}_create']}"
     if page_id:
-        return notion(f"/pages/{page_id}", {"properties": properties}, "PATCH")["id"]
+        payload = {"properties": properties}
+        if icon:
+            payload["icon"] = icon
+        return notion(f"/pages/{page_id}", payload, "PATCH")["id"]
     payload = {"parent": {"type": "data_source_id", "data_source_id": SOURCES[role]},
                "properties": properties}
     if children:
         payload["children"] = children
+    if icon:
+        payload["icon"] = icon
     return notion("/pages", payload, "POST")["id"]
 
 
@@ -243,8 +254,25 @@ def ensure_lookup(role, value, index, duplicates, dry_run, counts):
     return page_id
 
 
+def ensure_year(timestamp, periods, dry_run, counts):
+    if not timestamp:
+        return None
+    try:
+        year = str(date_of_epoch(timestamp).year)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    date = f"{year}-01-01"
+    page = periods["year"].get(date)
+    if page:
+        return page["id"]
+    page_id = save("year", None, {"标题": prop_title(date), "日期": {"date": {"start": date}}},
+                   dry_run, counts)
+    periods["year"][date] = {"id": page_id}
+    return page_id
+
+
 def sync_books(shelf, note_rows, existing, duplicate_ids, lookup_indexes, lookup_duplicates,
-               mode, dry_run, counts):
+               periods, mode, dry_run, counts):
     by_id = {}
     for item in shelf.get("books", []):
         if item.get("bookId"):
@@ -294,6 +322,10 @@ def sync_books(shelf, note_rows, existing, duplicate_ids, lookup_indexes, lookup
         progress_read_time = prop_date(progress.get("updateTime"))
         if progress_read_time:
             props["最后阅读时间"] = progress_read_time
+        year_id = ensure_year(progress.get("updateTime") or book.get("readUpdateTime") or update_time,
+                              periods, dry_run, counts)
+        if year_id:
+            props["年"] = merged_relation(current, "年", year_id)
         current_status = (current.get("阅读状态") or {}).get("status")
         if fraction == 1:
             props["阅读状态"] = {"status": {"name": "已读"}}
@@ -307,10 +339,13 @@ def sync_books(shelf, note_rows, existing, duplicate_ids, lookup_indexes, lookup
         metadata_missing = bool(author_id and not relation_ids(current, "作者")) or \
             bool(category_id and not relation_ids(current, "分类")) or \
             bool(cover and not current.get("封面", {}).get("files")) or needs_progress
+        metadata_missing = metadata_missing or bool(year_id and not relation_ids(current, "年")) or \
+            not (prior or {}).get("icon")
         if prior and source_is_current and not metadata_backfill and not metadata_missing:
             result[book_id] = prior["id"]
             continue
-        result[book_id] = save("books", prior["id"] if prior else None, props, dry_run, counts)
+        result[book_id] = save("books", prior["id"] if prior else None, props, dry_run, counts,
+                               icon=BOOK_ICON if not (prior or {}).get("icon") else None)
     return result
 
 
@@ -379,22 +414,23 @@ def date_of_epoch(value):
 
 def sync_statistics(mode, dry_run, counts):
     today = dt.datetime.now(TZ).date()
-    years = [today.year]
-    if mode == "full":
+    months = [(today.year, today.month)]
+    if mode in ("full", "metadata_backfill"):
         overall = weread("/readdata/detail", mode="overall")
-        years = sorted({date_of_epoch(k).year for k in overall.get("readTimes", {})} | {today.year})
+        start = date_of_epoch(overall.get("registTime") or int(dt.datetime(today.year, 1, 1, tzinfo=TZ).timestamp()))
+        months = []
+        year, month = start.year, start.month
+        while (year, month) <= (today.year, today.month):
+            months.append((year, month))
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     daily = {}
-    for year in years:
-        data = weread("/readdata/detail", mode="annually",
-                      baseTime=int(dt.datetime(year, 7, 1, tzinfo=TZ).timestamp()))
-        # Annual dailyReadTimes are seconds; never infer them from monthly buckets.
-        values = data.get("dailyReadTimes") or {}
-        if not values and year == today.year:
-            data = weread("/readdata/detail", mode="monthly")
-            values = data.get("readTimes") or {}
-        for epoch, seconds in values.items():
+    for year, month in months:
+        data = weread("/readdata/detail", mode="monthly",
+                      baseTime=int(dt.datetime(year, month, 15, tzinfo=TZ).timestamp()))
+        # Monthly readTimes are the supported daily buckets when annual dailyReadTimes is absent.
+        for epoch, seconds in (data.get("readTimes") or {}).items():
             day = date_of_epoch(epoch)
-            if day.year == year and seconds is not None:
+            if seconds and day.year == year and day.month == month:
                 daily[day.isoformat()] = int(seconds)
     indexes, duplicate_dates = {}, {}
     for role in ("day", "week", "month", "year"):
@@ -414,6 +450,7 @@ def sync_statistics(mode, dry_run, counts):
                  "时长": {"number": seconds}, "时间戳": {"number": int(dt.datetime.fromisoformat(day).replace(tzinfo=TZ).timestamp())}}
         old = indexes["day"].get(day)
         day_ids[day] = save("day", old["id"] if old else None, props, dry_run, counts)
+        indexes["day"][day] = {"id": day_ids[day], "properties": props}
     buckets = defaultdict(lambda: defaultdict(list))
     for day, page_id in day_ids.items():
         date = dt.date.fromisoformat(day)
@@ -431,6 +468,7 @@ def sync_statistics(mode, dry_run, counts):
                 # The inverse relation on each day avoids the 100-item write cap.
                 period_id = old["id"] if old else save(role, None,
                     {"标题": prop_title(date), "日期": {"date": {"start": date}}}, dry_run, counts)
+                indexes[role][date] = {"id": period_id}
                 for day, day_id in day_ids.items():
                     day_date = dt.date.fromisoformat(day)
                     belongs = (role == "year" and day_date.year == int(date[:4])) or \
@@ -442,9 +480,11 @@ def sync_statistics(mode, dry_run, counts):
                 continue
             if old and set(old_ids) == set(merged):
                 continue
-            save(role, old["id"] if old else None,
-                 {"标题": prop_title(date), "日期": {"date": {"start": date}},
-                  "每日阅读统计": relation(merged)}, dry_run, counts)
+            period_id = save(role, old["id"] if old else None,
+                             {"标题": prop_title(date), "日期": {"date": {"start": date}},
+                              "每日阅读统计": relation(merged)}, dry_run, counts)
+            indexes[role][date] = {"id": period_id}
+    return indexes
 
 
 def main():
@@ -467,12 +507,12 @@ def main():
     for role in ("authors", "categories"):
         lookup_indexes[role], lookup_duplicates[role] = index_unique(all_pages(role), "标题")
         counts[f"{role}_ambiguous"] += len(lookup_duplicates[role])
+    periods = sync_statistics(mode, dry_run, counts)
     book_pages = sync_books(shelf, note_rows, books_existing, duplicate_ids,
-                            lookup_indexes, lookup_duplicates, mode, dry_run, counts)
+                            lookup_indexes, lookup_duplicates, periods, mode, dry_run, counts)
     if mode != "metadata_backfill":
         sync_notes(note_rows, book_pages, books_existing, all_pages("highlights"),
                    all_pages("notes"), mode, dry_run, counts)
-        sync_statistics(mode, dry_run, counts)
     lines = ["## 微信读书独立同步", f"Mode: {mode}; dry run: {dry_run}",
              f"Shelf: {len(shelf.get('books', []))} ebooks, {len(shelf.get('albums', []))} albums, "
              f"{1 if shelf.get('mp') else 0} article entry; notebooks: "
