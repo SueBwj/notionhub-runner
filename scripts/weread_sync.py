@@ -208,7 +208,6 @@ def sync_books(shelf, note_rows, existing, duplicate_ids, dry_run, counts):
     result = {}
     for book_id, book in by_id.items():
         if book_id in duplicate_ids:
-            counts["books_ambiguous"] += 1
             continue
         prior = existing.get(book_id)
         current = prior.get("properties", {}) if prior else {}
