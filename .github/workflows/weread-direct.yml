@@ -1,0 +1,41 @@
+name: 微信读书独立同步
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 同步范围
+        type: choice
+        options: [incremental, full]
+        default: incremental
+      dry_run:
+        description: 只读取并生成计划，不写入 Notion
+        type: boolean
+        default: false
+  schedule:
+    # Monday 09:17 Asia/Shanghai, in UTC.
+    - cron: '17 1 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weread-direct
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      WEREAD_API_KEY: ${{ secrets.WEREAD_API_KEY }}
+      NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+      SYNC_MODE: ${{ inputs.mode || 'incremental' }}
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Preflight and sync
+        run: python3 scripts/weread_sync.py

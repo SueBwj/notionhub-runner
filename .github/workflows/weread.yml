@@ -25,10 +25,6 @@ on:
         description: 同步参数 JSON
         required: false
         default: '{}'
-  schedule:
-    - cron: '37 16 * * *'
-
-
 permissions:
   contents: read
   actions: read
@@ -2211,4 +2207,3 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.aggregate.outputs.status }}" = "failure" ]; then exit 1; fi
-
