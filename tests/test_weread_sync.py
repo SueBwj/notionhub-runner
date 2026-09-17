@@ -42,6 +42,44 @@ class SyncTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "needs upgrading"):
                     sync.weread("/shelf/sync")
 
+    def test_progress_is_converted_to_notion_percent(self):
+        self.assertEqual(sync.progress_fraction(45), 0.45)
+        self.assertEqual(sync.progress_fraction(100), 1)
+        self.assertIsNone(sync.progress_fraction(None))
+
+    def test_lookup_reuses_existing_title_and_preserves_relations(self):
+        indexes = {"作者甲": {"id": "author-page"}}
+        counts = sync.Counter()
+        with patch.object(sync, "save") as save:
+            page_id = sync.ensure_lookup("authors", " 作者甲 ", indexes, set(), False, counts)
+        self.assertEqual(page_id, "author-page")
+        save.assert_not_called()
+        props = {"作者": {"relation": [{"id": "manual-author"}]}}
+        self.assertEqual(sync.merged_relation(props, "作者", "author-page"), {
+            "relation": [{"id": "manual-author"}, {"id": "author-page"}]})
+
+    def test_metadata_backfill_writes_author_category_duration_and_progress(self):
+        existing = {"book-1": {"id": "book-page", "properties": {
+            "微信读书更新时间": {"number": 10}, "作者": {"relation": []},
+            "分类": {"relation": []}, "阅读时长": {"number": None},
+            "阅读进度": {"number": None}, "封面": {"files": []},
+        }}}
+        indexes = {"authors": {"作者甲": {"id": "author-page"}},
+                   "categories": {"分类甲": {"id": "category-page"}}}
+        shelf = {"books": [{"bookId": "book-1", "title": "书", "author": "作者甲",
+                             "category": "分类甲", "cover": "https://example.com/cover.jpg",
+                             "updateTime": 10}]}
+        counts = sync.Counter()
+        with patch.object(sync, "weread", return_value={"book": {"progress": 45, "recordReadingTime": 3600}}), \
+             patch.object(sync, "save", return_value="book-page") as save:
+            sync.sync_books(shelf, [], existing, set(), indexes,
+                            {"authors": set(), "categories": set()}, "metadata_backfill", False, counts)
+        properties = save.call_args.args[2]
+        self.assertEqual(properties["作者"], {"relation": [{"id": "author-page"}]})
+        self.assertEqual(properties["分类"], {"relation": [{"id": "category-page"}]})
+        self.assertEqual(properties["阅读时长"], {"number": 3600})
+        self.assertEqual(properties["阅读进度"], {"number": 0.45})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,15 +27,20 @@ SOURCES = {
     "week": "577978ae-e26a-83e2-9812-07435399bb0b",
     "month": "bf7978ae-e26a-8372-9542-07a74886bffb",
     "year": "fe7978ae-e26a-825b-becc-07f8105424ee",
+    "authors": "659978ae-e26a-82d0-8895-8789f27d2c30",
+    "categories": "c45978ae-e26a-8302-be63-87c33238d10a",
 }
 REQUIRED = {
-    "books": {"BookId": "rich_text", "书名": "title", "Sort": "number"},
+    "books": {"BookId": "rich_text", "书名": "title", "Sort": "number",
+              "作者": "relation", "分类": "relation", "阅读时长": "number", "阅读进度": "number"},
     "notes": {"reviewId": "rich_text", "Name": "title", "书籍": "relation"},
     "highlights": {"bookmarkId": "rich_text", "Name": "title", "书籍": "relation"},
     "day": {"标题": "title", "日期": "date", "时长": "number"},
     "week": {"标题": "title", "日期": "date", "每日阅读统计": "relation"},
     "month": {"标题": "title", "日期": "date", "每日阅读统计": "relation"},
     "year": {"标题": "title", "日期": "date", "每日阅读统计": "relation"},
+    "authors": {"标题": "title", "书籍": "relation"},
+    "categories": {"标题": "title", "书籍": "relation"},
 }
 
 
@@ -110,6 +115,32 @@ def relation(ids):
     return {"relation": [{"id": item} for item in ids]}
 
 
+def relation_ids(properties, name):
+    return [item["id"] for item in properties.get(name, {}).get("relation", [])]
+
+
+def merged_relation(properties, name, new_id):
+    return relation(list(dict.fromkeys(relation_ids(properties, name) + ([new_id] if new_id else []))))
+
+
+def normalise_lookup(value):
+    return " ".join(str(value or "").split())
+
+
+def cover_file(url):
+    if isinstance(url, str) and url.startswith("https://"):
+        return {"files": [{"name": "微信读书封面", "type": "external", "external": {"url": url}}]}
+    return None
+
+
+def progress_fraction(value):
+    """WeRead progress is an integer 0..100; Notion's property is percent 0..1."""
+    try:
+        return max(0, min(100, float(value))) / 100
+    except (ValueError, TypeError):
+        return None
+
+
 def paragraph(value):
     return [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": rich(value)}}] if value else []
 
@@ -142,7 +173,10 @@ def index_unique(rows, key):
     result, duplicates = {}, set()
     for row in rows:
         p = row.get("properties", {}).get(key, {})
-        value = text_value(p.get("rich_text", [])) if p.get("type") == "rich_text" else (p.get("date") or {}).get("start", "")
+        if p.get("type") in ("rich_text", "title"):
+            value = text_value(p.get(p["type"], []))
+        else:
+            value = (p.get("date") or {}).get("start", "")
         if not value:
             continue
         if value in result:
@@ -195,7 +229,22 @@ def reviews(book_id):
         cursor = next_cursor
 
 
-def sync_books(shelf, note_rows, existing, duplicate_ids, dry_run, counts):
+def ensure_lookup(role, value, index, duplicates, dry_run, counts):
+    key = normalise_lookup(value)
+    if not key:
+        return None
+    if key in duplicates:
+        counts[f"{role}_ambiguous"] += 1
+        return None
+    if key in index:
+        return index[key]["id"]
+    page_id = save(role, None, {"标题": prop_title(key)}, dry_run, counts)
+    index[key] = {"id": page_id, "properties": {"标题": prop_title(key)}}
+    return page_id
+
+
+def sync_books(shelf, note_rows, existing, duplicate_ids, lookup_indexes, lookup_duplicates,
+               mode, dry_run, counts):
     by_id = {}
     for item in shelf.get("books", []):
         if item.get("bookId"):
@@ -212,6 +261,17 @@ def sync_books(shelf, note_rows, existing, duplicate_ids, dry_run, counts):
         prior = existing.get(book_id)
         current = prior.get("properties", {}) if prior else {}
         props = {"BookId": prop_text(book_id), "书名": prop_title(book.get("title") or book_id)}
+        author_id = ensure_lookup("authors", book.get("author"), lookup_indexes["authors"],
+                                  lookup_duplicates["authors"], dry_run, counts)
+        category_id = ensure_lookup("categories", book.get("category"), lookup_indexes["categories"],
+                                    lookup_duplicates["categories"], dry_run, counts)
+        if author_id:
+            props["作者"] = merged_relation(current, "作者", author_id)
+        if category_id:
+            props["分类"] = merged_relation(current, "分类", category_id)
+        cover = cover_file(book.get("cover"))
+        if cover and not current.get("封面", {}).get("files"):
+            props["封面"] = cover
         update_time = int(book.get("updateTime") or 0)
         if update_time:
             props["微信读书更新时间"] = {"number": update_time}
@@ -220,11 +280,34 @@ def sync_books(shelf, note_rows, existing, duplicate_ids, dry_run, counts):
             props["最后阅读时间"] = read_time
         if book.get("deepLink", "").startswith("https://"):
             props["链接"] = {"url": book["deepLink"]}
-        if book.get("finishReading") == 1:
+        metadata_backfill = mode in ("full", "metadata_backfill")
+        needs_progress = metadata_backfill or not prior or \
+            current.get("阅读时长", {}).get("number") is None or \
+            current.get("阅读进度", {}).get("number") is None
+        progress = weread("/book/getprogress", bookId=book_id).get("book", {}) if needs_progress else {}
+        reading_time = progress.get("recordReadingTime")
+        if isinstance(reading_time, (int, float)):
+            props["阅读时长"] = {"number": reading_time}
+        fraction = progress_fraction(progress.get("progress"))
+        if fraction is not None:
+            props["阅读进度"] = {"number": fraction}
+        progress_read_time = prop_date(progress.get("updateTime"))
+        if progress_read_time:
+            props["最后阅读时间"] = progress_read_time
+        current_status = (current.get("阅读状态") or {}).get("status")
+        if fraction == 1:
             props["阅读状态"] = {"status": {"name": "已读"}}
-        elif book.get("readUpdateTime"):
+        elif fraction is not None and fraction > 0 and not current_status:
             props["阅读状态"] = {"status": {"name": "在读"}}
-        if prior and update_time and (current.get("微信读书更新时间", {}).get("number") or 0) >= update_time:
+        elif book.get("finishReading") == 1:
+            props["阅读状态"] = {"status": {"name": "已读"}}
+        elif book.get("readUpdateTime") and not current_status:
+            props["阅读状态"] = {"status": {"name": "在读"}}
+        source_is_current = update_time and (current.get("微信读书更新时间", {}).get("number") or 0) >= update_time
+        metadata_missing = bool(author_id and not relation_ids(current, "作者")) or \
+            bool(category_id and not relation_ids(current, "分类")) or \
+            bool(cover and not current.get("封面", {}).get("files")) or needs_progress
+        if prior and source_is_current and not metadata_backfill and not metadata_missing:
             result[book_id] = prior["id"]
             continue
         result[book_id] = save("books", prior["id"] if prior else None, props, dry_run, counts)
@@ -369,23 +452,31 @@ def main():
         if not os.environ.get(key):
             raise RuntimeError(f"Missing GitHub Actions secret: {key}")
     mode = os.environ.get("SYNC_MODE", "incremental")
-    if mode not in ("incremental", "full"):
-        raise RuntimeError("SYNC_MODE must be incremental or full")
+    if mode not in ("incremental", "metadata_backfill", "full"):
+        raise RuntimeError("SYNC_MODE must be incremental, metadata_backfill, or full")
     dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
     counts = Counter()
     get_schema()
     shelf = weread("/shelf/sync")
-    note_rows = notebooks()
+    # Metadata backfill deliberately avoids re-exporting notes/highlights/statistics.
+    note_rows = [] if mode == "metadata_backfill" else notebooks()
     book_rows = all_pages("books")
     books_existing, duplicate_ids = index_unique(book_rows, "BookId")
     counts["books_ambiguous"] += len(duplicate_ids)
-    book_pages = sync_books(shelf, note_rows, books_existing, duplicate_ids, dry_run, counts)
-    sync_notes(note_rows, book_pages, books_existing, all_pages("highlights"),
-               all_pages("notes"), mode, dry_run, counts)
-    sync_statistics(mode, dry_run, counts)
+    lookup_indexes, lookup_duplicates = {}, {}
+    for role in ("authors", "categories"):
+        lookup_indexes[role], lookup_duplicates[role] = index_unique(all_pages(role), "标题")
+        counts[f"{role}_ambiguous"] += len(lookup_duplicates[role])
+    book_pages = sync_books(shelf, note_rows, books_existing, duplicate_ids,
+                            lookup_indexes, lookup_duplicates, mode, dry_run, counts)
+    if mode != "metadata_backfill":
+        sync_notes(note_rows, book_pages, books_existing, all_pages("highlights"),
+                   all_pages("notes"), mode, dry_run, counts)
+        sync_statistics(mode, dry_run, counts)
     lines = ["## 微信读书独立同步", f"Mode: {mode}; dry run: {dry_run}",
              f"Shelf: {len(shelf.get('books', []))} ebooks, {len(shelf.get('albums', []))} albums, "
-             f"{1 if shelf.get('mp') else 0} article entry; notebooks: {len(note_rows)}", "",
+             f"{1 if shelf.get('mp') else 0} article entry; notebooks: "
+             f"{'skipped for metadata backfill' if mode == 'metadata_backfill' else len(note_rows)}", "",
              "| Action | Count |", "| --- | ---: |"]
     lines += [f"| {key} | {value} |" for key, value in sorted(counts.items())]
     report = "\n".join(lines) + "\n"

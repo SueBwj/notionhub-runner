@@ -6,7 +6,7 @@ on:
       mode:
         description: 同步范围
         type: choice
-        options: [incremental, full]
+        options: [incremental, metadata_backfill, full]
         default: incremental
       dry_run:
         description: 只读取并生成计划，不写入 Notion
